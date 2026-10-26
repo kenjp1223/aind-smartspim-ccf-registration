@@ -399,6 +399,17 @@ def improve_segment_properties(precomputed_dir, acr, desc):
     p.write_text(json.dumps(info, indent=2))
 
 
+def deliver(work, final, on_network):
+    """Copy a locally produced output folder to its network destination."""
+    if not on_network:
+        return
+    import shutil
+
+    logger.info(f"Copying results to {final}")
+    shutil.copytree(work, final, dirs_exist_ok=True)
+    shutil.rmtree(work.parent, ignore_errors=True)
+
+
 # --------------------------------------------------------------------------
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -440,6 +451,17 @@ def main(argv=None):
     (out / "atlas").mkdir(exist_ok=True)
 
     setup_logging(out)
+
+    # tensorstore and CloudVolume can't write to Windows network (UNC) paths,
+    # so a network output folder is produced locally and copied over at the end.
+    final = out
+    on_network = str(final).startswith(("\\\\", "//"))
+    if on_network:
+        import tempfile
+
+        out = Path(tempfile.mkdtemp(prefix="ccfreg_")) / final.name
+        (out / "atlas").mkdir(parents=True)
+        logger.info(f"Output is on a network path: working in {out}, copying to {final} at the end")
 
     sample_dirs = parse_axes(args.sample_axes)
     atlas_dirs = parse_axes(args.atlas_axes)
@@ -515,15 +537,7 @@ def main(argv=None):
     reg_folder = out / "metadata" / "registration_metadata"
     reg_folder.mkdir(parents=True, exist_ok=True)
     precompute_path = out / "annotation_precomputed"
-    # CloudVolume writes through a file:// URL, which can't point at a Windows
-    # network (UNC) path: write to a local folder, then copy into place.
-    on_network = str(out).startswith(("\\\\", "//"))
-    if on_network:
-        import tempfile
-
-        ng_path = Path(tempfile.mkdtemp(prefix="ccfreg_ng_")) / "annotation_precomputed"
-    else:
-        ng_path = precompute_path
+    ng_path = precompute_path
     (ng_path / "segment_properties").mkdir(parents=True, exist_ok=True)
 
     cfg = {
@@ -615,24 +629,21 @@ def main(argv=None):
 
     from aind_ccf_reg import register  # heavy imports after argument checks
 
-    setup_logging(out)  # the package's imports reset logging handlers
+    setup_logging(final)  # the package's imports reset logging handlers
 
     img_array = register.Register._Register__read_zarr_image(None, level_path) if args.check else None
     if args.check:
         png = out / "orientation_check.png"
         orientation_check(img_array, spacing, sample_axes, tmpl_orient, tmpl_nii, png)
         logger.info(f"Wrote {png}. Check it, then run again without --check.")
+        deliver(out, final, on_network)
         return 0
 
     # args=[] stops argschema from parsing this script's own command line
     register.Register(input_data=cfg, args=[]).run()
     improve_segment_properties(ng_path, acr, desc)
-    if on_network:
-        import shutil
-
-        shutil.copytree(ng_path, precompute_path, dirs_exist_ok=True)
-        shutil.rmtree(ng_path.parent, ignore_errors=True)
-    logger.info(f"Done. Results in {out}")
+    deliver(out, final, on_network)
+    logger.info(f"Done. Results in {final}")
     return 0
 
 
