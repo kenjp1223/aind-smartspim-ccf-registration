@@ -106,8 +106,25 @@ class Register(ArgSchemaParser):
             Numpy array with the zarr image
         """
         image_path = str(image_path)
-        zarr_img = zarr.open(image_path, mode="r")
-        img_array = np.asarray(zarr_img)
+        if os.path.isfile(os.path.join(image_path, "zarr.json")):
+            # Zarr v3 / OME-Zarr 0.5 (e.g. sharded arrays): zarr 2.x cannot
+            # read these, tensorstore can.
+            import tensorstore as ts
+
+            store = ts.open(
+                {
+                    "driver": "zarr3",
+                    "kvstore": {
+                        "driver": "file",
+                        "path": os.path.abspath(image_path).replace("\\", "/"),
+                    },
+                },
+                read=True,
+            ).result()
+            img_array = store.read().result()
+        else:
+            zarr_img = zarr.open(image_path, mode="r")
+            img_array = np.asarray(zarr_img)
         img_array = np.squeeze(img_array)
         return img_array
 
@@ -294,14 +311,17 @@ class Register(ArgSchemaParser):
 
         logger.info("Start registering to template ....")
 
-        if self.args["reference_res"] == 25:
+        if self.args["ants_params"].get("syn_iterations"):
+            reg_iterations = list(self.args["ants_params"]["syn_iterations"])
+        elif self.args["reference_res"] == 25:
             reg_iterations = [200, 100, 25, 3]
         elif self.args["reference_res"] == 10:
             reg_iterations = [400, 200, 40, 0]
+        elif self.args["reference_res"] >= 15:
+            # Custom atlases (e.g. 20 um): use the 25 um schedule
+            reg_iterations = [200, 100, 25, 3]
         else:
-            raise ValueError(
-                f"Resolution {self.args['reference_res']} is not allowed. Allowed values are: 10, 25"
-            )
+            reg_iterations = [400, 200, 40, 0]
 
         start_time = datetime.now()
         registration_params = {
@@ -894,9 +914,13 @@ class Register(ArgSchemaParser):
 
         # read input data (lazy loading)
         # flake8: noqa: E501
-        image_path = Path(input_data_path).joinpath(
-            f"{self.args['input_channel']}.zarr/{self.args['input_scale']}"
-        )
+        if self.args.get("input_image_path"):
+            # Explicit path to one multiscale level (any zarr naming)
+            image_path = Path(os.path.abspath(self.args["input_image_path"]))
+        else:
+            image_path = Path(input_data_path).joinpath(
+                f"{self.args['input_channel']}.zarr/{self.args['input_scale']}"
+            )
         logger.info(f"Going to read zarr: {image_path}")
 
         data_processes = []

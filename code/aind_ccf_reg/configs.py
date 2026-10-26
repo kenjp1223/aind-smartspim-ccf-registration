@@ -36,6 +36,15 @@ class RegSchema(ArgSchema):
 
     input_scale = Int(metadata={"required": True, "description": "Zarr scale to start with"})
 
+    input_image_path = Str(
+        required=False,
+        allow_none=True,
+        metadata={
+            "description": "Optional explicit path to the zarr level to register "
+            "(overrides input_data/input_channel.zarr/input_scale)"
+        },
+    )
+
     input_orientation = sch_list(
         cls_or_instance=sch_dict,
         metadata={
