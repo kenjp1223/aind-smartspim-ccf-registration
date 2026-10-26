@@ -968,11 +968,15 @@ class Register(ArgSchemaParser):
 
         # Atlas alignment
         ants_params = self.args["ants_params"]
-        ants_params["new_spacing"] = (
-            self.args["reference_res"],
-            self.args["reference_res"],
-            self.args["reference_res"],
-        )
+        if ants_params.get("output_voxel_size"):
+            # anisotropic custom atlas: voxel size of the written atlas-space image
+            ants_params["new_spacing"] = tuple(ants_params["output_voxel_size"])
+        else:
+            ants_params["new_spacing"] = (
+                self.args["reference_res"],
+                self.args["reference_res"],
+                self.args["reference_res"],
+            )
 
         start_date_time = datetime.now(timezone.utc)
         resource_monitor = ResourceMonitor(interval_seconds=30.0).start()

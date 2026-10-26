@@ -15,10 +15,11 @@ Usage (from the repo's code/ folder, inside the uv env):
 
   # 1) check orientation only: writes orientation_check.png, no registration
   uv run python run_custom_atlas.py "Z:/.../Ex_488_Ch0_stitched.ome.zarr" \
-      --atlas-template ".../Kim_ref_adult_v1_brain.tif" \
-      --atlas-labels   ".../Kim_ref_adult_FP-label_v4.0.tif" \
-      --atlas-info     ".../atlas_info_KimRef_FPbasedLabel_v4.0.csv" \
-      --atlas-res 20 --check
+      --atlas-template ".../average_template_25.nrrd" \
+      --atlas-labels   ".../annotation_25.nrrd" --atlas-res 25 --check
+
+  # other atlases: add --atlas-info <CSV id,acronym,name>; anisotropic tif atlases
+  # take three sizes, e.g. --atlas-res 50 20 20 (tif z y x)
 
   # 2) the real run: same command without --check
 
@@ -28,7 +29,9 @@ Outputs (default: <sample folder>/registration_<atlas>/<channel>/):
   OMEZarr/image.zarr              same, as OME-Zarr
   annotation_precomputed/         atlas labels in the brain's voxel grid
                                   (Neuroglancer precomputed segmentation,
-                                  region names on hover)
+                                  region names on hover). Segment IDs are
+                                  consecutive indices: label_map.csv maps
+                                  them to the atlas's own IDs.
   metadata/registration_metadata/ QC images (reg_*.png, prep_*.png, ...)
   run_config.json                 everything this run used
 """
@@ -57,6 +60,8 @@ OPPOSITE = {
 DEFAULT_SAMPLE_AXES = "inferior_to_superior,anterior_to_posterior,left_to_right"
 # Coronal atlas stack read as (plane, row, column)
 DEFAULT_ATLAS_AXES = "anterior_to_posterior,superior_to_inferior,left_to_right"
+# (the Allen CCF .nrrd files are stored the same way: AP, DV, LR)
+CCF_ANNOTATION_MAP = Path(__file__).resolve().parent / "aind_ccf_reg" / "ccf_files" / "annotation_map.json"
 
 logger = logging.getLogger("run_custom_atlas")
 
@@ -176,7 +181,10 @@ def level_spacings_mm(ms):
 
 
 def pick_level(levels, atlas_res_mm, forced=None):
-    """Coarsest level that is not coarser than the atlas (largest voxel <= atlas)."""
+    """
+    Coarsest level that is not coarser than the atlas's finest axis
+    (largest sample voxel <= smallest atlas voxel).
+    """
     if forced is not None:
         for path, sp in levels:
             if str(path) == str(forced):
@@ -192,7 +200,10 @@ def pick_level(levels, atlas_res_mm, forced=None):
 # atlas files
 # --------------------------------------------------------------------------
 def tif_voxel_um(path):
-    """Voxel size in um stored in a tif (ImageJ 'spacing' / resolution tags), or None."""
+    """
+    Voxel size (axis 0, 1, 2) in um stored in an ImageJ tif: 'spacing' for the
+    plane axis, XResolution/YResolution for rows/columns. None if incomplete.
+    """
     import tifffile
 
     try:
@@ -200,19 +211,19 @@ def tif_voxel_um(path):
             ij = tf.imagej_metadata or {}
             unit = str(ij.get("unit", "")).lower().replace("\\u00b5", "u").replace("µ", "u")
             factor = {"um": 1, "micron": 1, "microns": 1, "mm": 1000, "nm": 1e-3}.get(unit)
-            if factor and ij.get("spacing"):
-                return float(ij["spacing"]) * factor
             tags = tf.pages[0].tags
-            if "XResolution" in tags and factor:
-                num, den = tags["XResolution"].value
-                if num:
-                    return den / num * factor
+            if not (factor and ij.get("spacing") and "XResolution" in tags):
+                return None
+            xn, xd = tags["XResolution"].value
+            yn, yd = tags["YResolution"].value if "YResolution" in tags else (xn, xd)
+            if xn and yn:
+                return (float(ij["spacing"]) * factor, yd / yn * factor, xd / xn * factor)
     except Exception:
         pass
     return None
 
 
-def read_volume(path):
+def read_volume(path, labels=False):
     path = str(path)
     if path.lower().endswith((".tif", ".tiff")):
         import tifffile
@@ -220,7 +231,9 @@ def read_volume(path):
         return np.asarray(tifffile.imread(path)), None
     import ants
 
-    img = ants.image_read(path)
+    # labels: read as integers. Allen CCF IDs go up to 614454277, beyond what
+    # float32 (ANTs' default pixel type) holds exactly.
+    img = ants.image_read(path, pixeltype="unsigned int" if labels else "float")
     return img.numpy(), img
 
 
@@ -228,10 +241,11 @@ def atlas_to_nifti(src, dst, spacing_mm, labels=False):
     """
     Write the atlas volume as NIfTI with identity direction and zero origin,
     keeping the array axis order exactly as stored (numpy axis i = ANTs axis i).
+    spacing_mm: voxel size of array axes 0, 1, 2 (anisotropic is fine).
     """
     import ants
 
-    arr, img = read_volume(src)
+    arr, img = read_volume(src, labels=labels)
     if arr.ndim != 3:
         arr = np.squeeze(arr)
     if arr.ndim != 3:
@@ -239,8 +253,18 @@ def atlas_to_nifti(src, dst, spacing_mm, labels=False):
     if labels:
         if np.issubdtype(arr.dtype, np.floating):
             arr = np.rint(arr)
-        arr = arr.astype(np.uint32)
-        out = ants.from_numpy(arr.astype(np.float32), spacing=(spacing_mm,) * 3)
+        arr = arr.astype(np.uint64)
+        # ANTs warps labels as float32, exact only up to 2**24. Large atlas IDs
+        # (Allen CCF) are replaced by consecutive indices for the warp; the
+        # returned table maps them back (0 stays 0 = outside the brain).
+        ids, compact = np.unique(arr, return_inverse=True)
+        if ids[0] != 0:
+            ids = np.concatenate([[0], ids])
+            compact = compact + 1
+        compact = compact.reshape(arr.shape).astype(np.float32)
+        out = ants.from_numpy(compact, spacing=tuple(spacing_mm))
+        ants.image_write(out, str(dst))
+        return arr.shape, {i: int(a) for i, a in enumerate(ids)}
     else:
         # Same 2-98 percentile scaling the pipeline applies to the brain, so the
         # template and the brain share an intensity range (QC plots assume 0-1.5).
@@ -250,13 +274,20 @@ def atlas_to_nifti(src, dst, spacing_mm, labels=False):
             p0, p1 = np.percentile(nz, [2, 98])
             if p1 > p0:
                 arr = (np.maximum(arr, p0) - p0) / (p1 - p0)
-        out = ants.from_numpy(arr, spacing=(spacing_mm,) * 3)
+        out = ants.from_numpy(arr, spacing=tuple(spacing_mm))
     ants.image_write(out, str(dst))
     return arr.shape, arr.dtype
 
 
 def read_regions(csv_path, id_col=None, name_col=None, desc_col=None):
-    """{label id (str): acronym}, {label id: full name} from the atlas info CSV."""
+    """
+    {label id (str): acronym}, {label id: full name} from the atlas info CSV,
+    or from a JSON {id: acronym} such as the repo's CCF annotation_map.json.
+    """
+    if str(csv_path).lower().endswith(".json"):
+        acr = {str(k): str(v) for k, v in json.loads(Path(csv_path).read_text()).items()}
+        logger.info(f"Regions: {len(acr)} from {csv_path}")
+        return acr, {}
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         sample = f.read(4096)
         f.seek(0)
@@ -354,7 +385,7 @@ def orientation_check(img_array, spacing_mm, sample_axes, tmpl_orient, atlas_nii
 
 
 def improve_segment_properties(precomputed_dir, acr, desc):
-    """Add the full region name as a description next to the acronym label."""
+    """Add the full region name (and atlas ID) as a description next to the label."""
     if not desc:
         return
     p = Path(precomputed_dir) / "segment_properties" / "info"
@@ -374,8 +405,13 @@ def main(argv=None):
     ap.add_argument("zarr", help="channel OME-Zarr, e.g. ...\\Ex_488_Ch0_stitched.ome.zarr")
     ap.add_argument("--atlas-template", required=True, help="atlas template volume (tif or nii)")
     ap.add_argument("--atlas-labels", required=True, help="atlas label volume, same grid")
-    ap.add_argument("--atlas-info", required=True, help="CSV: label id -> region acronym/name")
-    ap.add_argument("--atlas-res", type=float, help="atlas voxel size in um (required for tif)")
+    ap.add_argument("--atlas-info", default=str(CCF_ANNOTATION_MAP),
+                    help="CSV (id, acronym, name) or JSON {id: acronym} for the label IDs "
+                         "(default: the repo's Allen CCF annotation_map.json)")
+    ap.add_argument("--atlas-res", type=float, nargs="+", metavar="UM",
+                    help="atlas voxel size in um: one value (isotropic) or three for "
+                         "array axes 0 1 2, i.e. the tif's z y x (e.g. 50 20 20 for 50 um "
+                         "coronal sections at 20 um in-plane)")
     ap.add_argument("--atlas-axes", default=DEFAULT_ATLAS_AXES,
                     help=f"directions of atlas array axes 0,1,2 (default {DEFAULT_ATLAS_AXES})")
     ap.add_argument("--sample-axes", default=DEFAULT_SAMPLE_AXES,
@@ -418,25 +454,50 @@ def main(argv=None):
             if um is None:
                 raise SystemExit(
                     f"{tmpl_src} does not store its voxel size; pass --atlas-res "
-                    "(um, the same value your ClearMap atlas config uses)"
+                    "(um, z y x of the tif, the values your ClearMap atlas config uses)"
                 )
-            logger.info(f"Atlas voxel size from tif metadata: {um:g} um")
-            atlas_res_mm = um / 1000.0
+            logger.info(f"Atlas voxel size from tif metadata: {um} um")
+            atlas_sp_mm = tuple(u / 1000.0 for u in um)
         else:
             import ants
 
-            atlas_res_mm = float(min(ants.image_header_info(str(tmpl_src))["spacing"]))
+            sp = [float(s) for s in ants.image_header_info(str(tmpl_src))["spacing"]]
+            # Allen .nrrd headers give micrometres (25), NIfTI usually mm (0.025)
+            if min(sp) > 1:
+                logger.info(f"Header voxel size {sp} read as um")
+                sp = [x / 1000.0 for x in sp]
+            atlas_sp_mm = tuple(sp)
+    elif len(args.atlas_res) == 1:
+        atlas_sp_mm = (args.atlas_res[0] / 1000.0,) * 3
+    elif len(args.atlas_res) == 3:
+        atlas_sp_mm = tuple(r / 1000.0 for r in args.atlas_res)
     else:
-        atlas_res_mm = args.atlas_res / 1000.0
+        raise SystemExit("--atlas-res takes one value or three (z y x of the atlas tif)")
+    atlas_res_mm = min(atlas_sp_mm)  # finest axis: decides which zarr level to use
     tmpl_nii = out / "atlas" / "template.nii.gz"
     lab_nii = out / "atlas" / "labels.nii.gz"
-    tshape, _ = atlas_to_nifti(tmpl_src, tmpl_nii, atlas_res_mm)
-    lshape, _ = atlas_to_nifti(args.atlas_labels, lab_nii, atlas_res_mm, labels=True)
+    tshape, _ = atlas_to_nifti(tmpl_src, tmpl_nii, atlas_sp_mm)
+    lshape, id_map = atlas_to_nifti(args.atlas_labels, lab_nii, atlas_sp_mm, labels=True)
     if tshape != lshape:
         raise SystemExit(f"Template {tshape} and labels {lshape} are not the same grid")
     identity = out / "atlas" / "identity.mat"
     write_identity(identity)
-    acr, desc = read_regions(args.atlas_info, args.id_col, args.name_col, args.desc_col)
+    names, full = read_regions(args.atlas_info, args.id_col, args.name_col, args.desc_col)
+    # Region tables keyed by the compact index used in the warped label volume
+    acr, desc = {}, {}
+    missing = 0
+    with open(out / "label_map.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["segment_id", "atlas_id", "acronym", "name"])
+        for c_id, a_id in id_map.items():
+            key = str(a_id)
+            if a_id and key not in names:
+                missing += 1
+            acr[str(c_id)] = names.get(key, "outside" if a_id == 0 else key)
+            desc[str(c_id)] = f"{full.get(key, acr[str(c_id)])} (atlas id {a_id})"
+            w.writerow([c_id, a_id, acr[str(c_id)], full.get(key, "")])
+    logger.info(f"{len(id_map) - 1} labels in the atlas volume; segment IDs -> atlas IDs in "
+                f"label_map.csv" + (f"; {missing} IDs have no name in {args.atlas_info}" if missing else ""))
 
     # ---- sample level ----
     ms, fmt = read_multiscales(zarr_path)
@@ -446,8 +507,10 @@ def main(argv=None):
     logger.info(f"Sample {zarr_path} (zarr v{fmt}); levels: "
                 + ", ".join(f"{p}: {tuple(round(s * 1000, 2) for s in sp)} um" for p, sp in levels))
     logger.info(f"Registering level {level}, voxel {tuple(round(s * 1000, 2) for s in spacing)} um "
-                f"(z, y, x) to atlas at {atlas_res_mm * 1000:g} um, template {tshape}")
+                f"(z, y, x) to atlas at {tuple(round(s * 1000, 2) for s in atlas_sp_mm)} um "
+                f"(axes 0, 1, 2), template {tshape}")
 
+    # reference_res only picks the SyN iteration schedule (finest atlas axis)
     reference_res = int(round(atlas_res_mm * 1000))
     reg_folder = out / "metadata" / "registration_metadata"
     reg_folder.mkdir(parents=True, exist_ok=True)
@@ -497,6 +560,10 @@ def main(argv=None):
             "moved_to_template_path": str(reg_folder / "moved_ls_to_template.nii.gz"),
             "moved_to_ccf_path": str(out / "moved_ls_to_ccf.nii.gz"),
             "ccf_anno_to_brain_path": str(reg_folder / "moved_ccf_anno_to_ls.nii.gz"),
+            # voxel size (um) of OMEZarr/image.zarr (the brain in atlas space).
+            # register.run writes the atlas-grid array with its axes reversed,
+            # so the sizes go in reverse atlas-axis order.
+            "output_voxel_size": tuple(s * 1000 for s in atlas_sp_mm[::-1]),
         },
         "OMEZarr_params": {
             "clevel": 1,
@@ -531,7 +598,7 @@ def main(argv=None):
         "atlas_template": str(args.atlas_template),
         "atlas_labels": str(args.atlas_labels),
         "atlas_info": str(args.atlas_info),
-        "atlas_res_um": atlas_res_mm * 1000,
+        "atlas_voxel_um_axes_012": [s * 1000 for s in atlas_sp_mm],
         "sample_axes": sample_dirs,
         "atlas_axes": atlas_dirs,
     }
