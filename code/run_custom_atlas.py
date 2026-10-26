@@ -515,7 +515,16 @@ def main(argv=None):
     reg_folder = out / "metadata" / "registration_metadata"
     reg_folder.mkdir(parents=True, exist_ok=True)
     precompute_path = out / "annotation_precomputed"
-    (precompute_path / "segment_properties").mkdir(parents=True, exist_ok=True)
+    # CloudVolume writes through a file:// URL, which can't point at a Windows
+    # network (UNC) path: write to a local folder, then copy into place.
+    on_network = str(out).startswith(("\\\\", "//"))
+    if on_network:
+        import tempfile
+
+        ng_path = Path(tempfile.mkdtemp(prefix="ccfreg_ng_")) / "annotation_precomputed"
+    else:
+        ng_path = precompute_path
+    (ng_path / "segment_properties").mkdir(parents=True, exist_ok=True)
 
     cfg = {
         "input_data": str(zarr_path.parent),
@@ -576,7 +585,7 @@ def main(argv=None):
         },
         "ng_params": {
             # forward slashes: CloudVolume builds a file:// URL from this
-            "save_path": precompute_path.as_posix(),
+            "save_path": ng_path.as_posix(),
             "regions": acr,
             "scale_params": {
                 "encoding": "compresso",
@@ -617,7 +626,12 @@ def main(argv=None):
 
     # args=[] stops argschema from parsing this script's own command line
     register.Register(input_data=cfg, args=[]).run()
-    improve_segment_properties(precompute_path, acr, desc)
+    improve_segment_properties(ng_path, acr, desc)
+    if on_network:
+        import shutil
+
+        shutil.copytree(ng_path, precompute_path, dirs_exist_ok=True)
+        shutil.rmtree(ng_path.parent, ignore_errors=True)
     logger.info(f"Done. Results in {out}")
     return 0
 

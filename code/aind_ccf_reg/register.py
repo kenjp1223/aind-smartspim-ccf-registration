@@ -109,19 +109,31 @@ class Register(ArgSchemaParser):
         if os.path.isfile(os.path.join(image_path, "zarr.json")):
             # Zarr v3 / OME-Zarr 0.5 (e.g. sharded arrays): zarr 2.x cannot
             # read these, tensorstore can.
+            import shutil
+            import tempfile
+
             import tensorstore as ts
 
-            store = ts.open(
-                {
-                    "driver": "zarr3",
-                    "kvstore": {
-                        "driver": "file",
-                        "path": os.path.abspath(image_path).replace("\\", "/"),
+            local = os.path.abspath(image_path)
+            tmp = None
+            if local.startswith(("\\\\", "//")):
+                # tensorstore rejects Windows network (UNC) paths: copy this one
+                # level (a few hundred MB at registration resolution) locally.
+                tmp = tempfile.mkdtemp(prefix="ccfreg_zarr_")
+                logger.info(f"Copying {image_path} to {tmp} (network path)")
+                local = shutil.copytree(local, os.path.join(tmp, "level"))
+            try:
+                store = ts.open(
+                    {
+                        "driver": "zarr3",
+                        "kvstore": {"driver": "file", "path": local.replace("\\", "/")},
                     },
-                },
-                read=True,
-            ).result()
-            img_array = store.read().result()
+                    read=True,
+                ).result()
+                img_array = store.read().result()
+            finally:
+                if tmp:
+                    shutil.rmtree(tmp, ignore_errors=True)
         else:
             zarr_img = zarr.open(image_path, mode="r")
             img_array = np.asarray(zarr_img)
