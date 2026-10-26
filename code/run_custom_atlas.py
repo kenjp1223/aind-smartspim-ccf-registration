@@ -40,6 +40,7 @@ import argparse
 import csv
 import json
 import logging
+import shutil
 import sys
 from pathlib import Path
 
@@ -399,15 +400,74 @@ def improve_segment_properties(precomputed_dir, acr, desc):
     p.write_text(json.dumps(info, indent=2))
 
 
-def deliver(work, final, on_network):
-    """Copy a locally produced output folder to its network destination."""
-    if not on_network:
-        return
-    import shutil
+TRANSFORMS = (
+    "ls_to_template_SyN_0GenericAffine.mat",
+    "ls_to_template_SyN_1Warp.nii.gz",
+    "ls_to_template_SyN_1InverseWarp.nii.gz",
+)
 
+
+def patch_cloudfiles():
+    """
+    Windows' monotonic clock ticks every ~16 ms, so a fast local file read in
+    cloudfiles' transfer monitor can start and end on the same tick, and its
+    IntervalTree refuses the zero-length interval. Give it 1 us instead.
+    """
+    try:
+        import time
+
+        from cloudfiles import monitoring
+    except ImportError:
+        return
+
+    def end_io(self, flight_id, num_bytes):
+        end_us = int(time.monotonic() * 1e6)
+        with self._lock:
+            start_us = int(self._in_flight.pop(flight_id) * 1e6)
+            self._in_flight_bytes -= num_bytes
+            self._intervaltree.addi(start_us, max(end_us, start_us + 1), [flight_id, num_bytes])
+            self._total_bytes_landed += num_bytes
+
+    monitoring.TransmissionMonitor.end_io = end_io
+
+
+def resumable(register_cls):
+    """Register subclass that reuses finished transforms instead of recomputing them."""
+    import ants
+
+    class ResumableRegister(register_cls):
+        reuse = True
+
+        def register_to_template(self, ants_fixed, ants_moving, moving_mask=None):
+            rf = Path(self.args["results_folder"])
+            if self.reuse and all((rf / t).is_file() for t in TRANSFORMS):
+                logger.info(f"Reusing the transforms in {rf} (use --redo to recompute)")
+                moved = ants.apply_transforms(
+                    fixed=ants_fixed,
+                    moving=ants_moving,
+                    transformlist=[str(rf / TRANSFORMS[1]), str(rf / TRANSFORMS[0])],
+                )
+                self._qc_reg(
+                    ants_moving,
+                    ants_fixed,
+                    moved,
+                    moved_path=self.args["ants_params"].get("moved_to_template_path"),
+                    figpath_name="reg_to_template",
+                )
+                return moved
+            return super().register_to_template(ants_fixed, ants_moving, moving_mask)
+
+    return ResumableRegister
+
+
+def deliver(work, final, on_network, cleanup=True):
+    """Copy a locally produced output folder to its network destination."""
+    if not on_network or not work.is_dir():
+        return
     logger.info(f"Copying results to {final}")
     shutil.copytree(work, final, dirs_exist_ok=True)
-    shutil.rmtree(work.parent, ignore_errors=True)
+    if cleanup:
+        shutil.rmtree(work.parent, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------
@@ -431,6 +491,8 @@ def main(argv=None):
     ap.add_argument("--out", help="output folder (default: <sample>/registration_<atlas>/<channel>)")
     ap.add_argument("--id-col"), ap.add_argument("--name-col"), ap.add_argument("--desc-col")
     ap.add_argument("--syn-iterations", help="e.g. 200,100,25,3")
+    ap.add_argument("--redo", action="store_true",
+                    help="recompute the registration even if transforms from an earlier run exist")
     ap.add_argument("--check", action="store_true",
                     help="only write orientation_check.png and the plan; no registration")
     args = ap.parse_args(argv)
@@ -640,7 +702,20 @@ def main(argv=None):
         return 0
 
     # args=[] stops argschema from parsing this script's own command line
-    register.Register(input_data=cfg, args=[]).run()
+    patch_cloudfiles()
+    if on_network and not args.redo:
+        # transforms from an earlier (possibly failed) run in the final folder
+        for t in TRANSFORMS:
+            if (final / t).is_file() and not (out / t).is_file():
+                shutil.copy2(final / t, out / t)
+    reg = resumable(register.Register)(input_data=cfg, args=[])
+    reg.reuse = not args.redo
+    try:
+        reg.run()
+    except BaseException:
+        # keep whatever was produced (transforms, QC) so a rerun can reuse it
+        deliver(out, final, on_network, cleanup=False)
+        raise
     improve_segment_properties(ng_path, acr, desc)
     deliver(out, final, on_network)
     logger.info(f"Done. Results in {final}")
