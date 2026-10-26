@@ -385,6 +385,31 @@ def orientation_check(img_array, spacing_mm, sample_axes, tmpl_orient, atlas_nii
     plt.close(fig)
 
 
+def fix_precomputed_info(precomputed_dir):
+    """
+    Make the label pyramid's info file complete for Neuroglancer: add
+    voxel_offset, and set each scale's size to what was actually written
+    (the pipeline's info uses floor(size / 2**s), its downsampling round()).
+    """
+    import re
+
+    p = Path(precomputed_dir) / "info"
+    info = json.loads(p.read_text())
+    pat = re.compile(r"^(\d+)-(\d+)_(\d+)-(\d+)_(\d+)-(\d+)$")
+    for sc in info["scales"]:
+        ends = [0, 0, 0]
+        d = Path(precomputed_dir) / sc["key"]
+        for f in d.iterdir() if d.is_dir() else []:
+            m = pat.match(f.name.split(".")[0])
+            if m:
+                v = [int(x) for x in m.groups()]
+                ends = [max(ends[0], v[1]), max(ends[1], v[3]), max(ends[2], v[5])]
+        if all(ends):
+            sc["size"] = ends
+        sc["voxel_offset"] = [0, 0, 0]
+    p.write_text(json.dumps(info, indent=2))
+
+
 def improve_segment_properties(precomputed_dir, acr, desc):
     """Add the full region name (and atlas ID) as a description next to the label."""
     if not desc:
@@ -716,6 +741,7 @@ def main(argv=None):
         # keep whatever was produced (transforms, QC) so a rerun can reuse it
         deliver(out, final, on_network, cleanup=False)
         raise
+    fix_precomputed_info(ng_path)
     improve_segment_properties(ng_path, acr, desc)
     deliver(out, final, on_network)
     logger.info(f"Done. Results in {final}")
