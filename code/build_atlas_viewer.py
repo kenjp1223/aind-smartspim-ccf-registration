@@ -18,6 +18,19 @@ OME-Zarr volumes plus ready-made Neuroglancer views:
 
 Every volume has the same 25 um grid and origin, so they overlay exactly.
 
+Left/right: injections are often counterbalanced between hemispheres. By
+default every brain whose signal is mostly on the other side is mirrored
+(about the atlas midline, found from the reference labels) so all brains have
+their strong side on the same side before group means are taken:
+  --align-side auto     the side most brains already have (default)
+  --align-side low|high the low- or high-index side of the left/right axis
+  --align-side none     no automatic mirroring
+  --flip TEXT / --keep TEXT   force mirroring / no mirroring of the brains
+                              whose name contains TEXT (repeatable)
+The index page lists what was mirrored and has a "mirror" switch per brain
+for the per-brain layers (group means keep the build-time choice; rebuild with
+--flip/--keep to change those).
+
 Usage (from the repo's code/ folder):
   uv run python build_atlas_viewer.py <sample> <sample> ... ^
       --reference "<Kim_to_allen25_ann_fwdtransforms.tif>" ^
@@ -120,6 +133,61 @@ def write_segment_properties(zarr_path, ids, names):
 
 
 # --------------------------------------------------------------------------
+# Left/right alignment
+# --------------------------------------------------------------------------
+def find_midline(ref, max_shift=8):
+    """
+    (axis, centre) of the atlas's mirror plane, found from the brain mask:
+    mirroring index i -> centre - i along that axis maps the mask best onto
+    itself. centre = n - 1 means a plain np.flip.
+    """
+    def search(mask, axes, shifts):
+        best = None
+        for ax in axes:
+            n = mask.shape[ax]
+            for shift in shifts:
+                m = mirror(mask, ax, n - 1 + shift)
+                union = np.logical_or(m, mask).sum()
+                iou = np.logical_and(m, mask).sum() / union if union else 0.0
+                if best is None or iou > best[0]:
+                    best = (iou, ax, n - 1 + shift)
+        return best
+
+    mask = ref > 0
+    # which axis: on every 2nd voxel; then the exact plane on that axis at full resolution
+    _, ax, _ = search(np.ascontiguousarray(mask[::2, ::2, ::2]), range(3), range(-max_shift // 2, max_shift // 2 + 1))
+    iou, ax, centre = search(mask, [ax], range(-max_shift, max_shift + 1))
+    logger.info(f"mirror plane: axis {'zyx'[ax]} (#{ax}), index i <-> {centre} - i, brain-mask overlap {iou:.3f}")
+    if iou < 0.8:
+        logger.warning("the atlas is not clearly left/right symmetric; check the flips in Neuroglancer")
+    return ax, centre
+
+
+def mirror(a, ax, centre):
+    """out[..., i, ...] = a[..., centre - i, ...] along axis ax (zeros where that falls outside)."""
+    n = a.shape[ax]
+    src = centre - np.arange(n)
+    ok = (src >= 0) & (src < n)
+    out = np.zeros_like(a)
+    dst_idx = [slice(None)] * a.ndim
+    src_idx = [slice(None)] * a.ndim
+    dst_idx[ax] = np.nonzero(ok)[0]
+    src_idx[ax] = src[ok]
+    out[tuple(dst_idx)] = a[tuple(src_idx)]
+    return out
+
+
+def side_totals(a, ax, centre):
+    """(signal on the low-index side, signal on the high-index side) of the mirror plane."""
+    i = np.arange(a.shape[ax])
+    shape = [1, 1, 1]
+    shape[ax] = -1
+    i = i.reshape(shape)
+    a = np.nan_to_num(a)
+    return float((a * (2 * i < centre)).sum()), float((a * (2 * i > centre)).sum())
+
+
+# --------------------------------------------------------------------------
 # Neuroglancer views
 # --------------------------------------------------------------------------
 def image_shader(color, rng):
@@ -203,24 +271,72 @@ def views(cfg):
 
 
 INDEX_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>Atlas viewer</title>
-<style>body{font:15px system-ui,sans-serif;margin:2em;max-width:60em;background:#111;color:#ddd}
-a{color:#7cf}li{margin:.4em 0}code{color:#fc9}</style></head><body>
+<style>body{font:15px system-ui,sans-serif;margin:2em;max-width:64em;background:#111;color:#ddd}
+a{color:#7cf}li{margin:.4em 0}code{color:#fc9}table{border-collapse:collapse;margin:.5em 0}
+td,th{padding:.25em .8em;border-bottom:1px solid #333;text-align:left}th{color:#aaa;font-weight:normal}
+.note{color:#999;font-size:13px}</style></head><body>
 <h2>Atlas-space comparison</h2>
 <p id=info></p>
 <ul id=views></ul>
 <p>All layers share the 25&nbsp;um atlas grid. Hover over a voxel to read every layer's value and the region name.
 Toggle layers by clicking their tab; change contrast in the layer's panel (double-click the tab).</p>
+<h3>Left / right</h3>
+<p id=hinfo class=note></p>
+<table id=brains><tr><th>brain</th><th>signal low / high side</th><th>mirrored at build</th><th>mirror now</th></tr></table>
+<p class=note>"Mirror now" flips that brain's own layers in the links above (tick, then open a view).
+Group means and the difference keep the build-time choice; to change them, rebuild with
+<code>--flip NAME</code> or <code>--keep NAME</code>.</p>
 <script>
 const BASE = location.origin + location.pathname.replace(/\\/[^/]*$/, "");
-fetch("views.json").then(r => r.json()).then(v => {
-  document.getElementById("info").textContent = v.description;
+let V = null;
+const extra = new Set();
+
+function mirrored(src, h) {
+  // the same volume seen through a left/right mirror: i -> centre - i along the left/right axis
+  const M = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]];
+  M[h.axis_index][h.axis_index] = -1;
+  M[h.axis_index][3] = h.centre;
+  return {url: src, transform: {outputDimensions: h.dimensions, matrix: M}};
+}
+
+function render() {
   const ul = document.getElementById("views");
-  for (const [name, st] of Object.entries(v.views)) {
-    const s = JSON.stringify(st).split("{BASE}").join(BASE);
+  ul.innerHTML = "";
+  for (const [name, st0] of Object.entries(V.views)) {
+    const st = JSON.parse(JSON.stringify(st0).split("{BASE}").join(BASE));
+    for (const l of st.layers) {
+      if (typeof l.source !== "string") continue;
+      for (const b of extra) {
+        if (l.source.endsWith("/samples/" + b + ".ome.zarr")) l.source = mirrored(l.source, V.hemispheres);
+      }
+    }
     const li = document.createElement("li"), a = document.createElement("a");
-    a.href = location.origin + "/ng/#!" + encodeURIComponent(s);
-    a.textContent = v.titles[name] || name; li.appendChild(a); ul.appendChild(li);
+    a.href = location.origin + "/ng/#!" + encodeURIComponent(JSON.stringify(st));
+    a.textContent = V.titles[name] || name;
+    li.appendChild(a); ul.appendChild(li);
   }
+}
+
+fetch("views.json").then(r => r.json()).then(v => {
+  V = v;
+  document.getElementById("info").textContent = v.description;
+  const h = v.hemispheres;
+  if (h) {
+    document.getElementById("hinfo").textContent =
+      `Left/right axis: ${h.axis} (mirror plane at index ${h.centre / 2}). ` +
+      (h.target === "none" ? "No automatic mirroring." :
+       `Brains were mirrored so that their stronger side is the ${h.target}-index side.`);
+    const tb = document.getElementById("brains");
+    for (const [b, s] of Object.entries(h.brains)) {
+      const tr = document.createElement("tr");
+      const fmt = x => x.toPrecision(3);
+      tr.innerHTML = `<td>${b}</td><td>${fmt(s.low)} / ${fmt(s.high)} (x${s.ratio})</td>` +
+                     `<td>${s.mirrored ? "yes" : "no"}</td><td><input type=checkbox></td>`;
+      tr.querySelector("input").onchange = e => { e.target.checked ? extra.add(b) : extra.delete(b); render(); };
+      tb.appendChild(tr);
+    }
+  }
+  render();
 });
 </script></body></html>
 """
@@ -238,6 +354,12 @@ def main(argv=None):
                     help="which map to show per brain (default: %(default)s)")
     ap.add_argument("--group", action="append", default=[], metavar="NAME=TEXT",
                     help="a group = samples whose folder name contains TEXT (repeat; first two are compared)")
+    ap.add_argument("--align-side", default="auto", choices=["auto", "low", "high", "none"],
+                    help="mirror brains so their strong side is on this side (default: %(default)s)")
+    ap.add_argument("--flip", action="append", default=[], metavar="TEXT",
+                    help="always mirror brains whose name contains TEXT")
+    ap.add_argument("--keep", action="append", default=[], metavar="TEXT",
+                    help="never mirror brains whose name contains TEXT")
     ap.add_argument("--voxel-um", type=float, default=25.0)
     ap.add_argument("--out", required=True, help="viewer folder to create")
     args = ap.parse_args(argv)
@@ -254,7 +376,9 @@ def main(argv=None):
     vox = [args.voxel_um] * 3
 
     # brains
-    maps, ref_orient, ccf_path = {}, None, None
+    ref = read_any(args.reference, labels=True)
+    lr_axis, centre = find_midline(ref)
+    maps, sides, ref_orient, ccf_path = {}, {}, None, None
     for s in args.samples:
         sd = Path(s.rstrip("/\\"))
         a_dir = sd / args.registration / args.atlas_space
@@ -265,6 +389,13 @@ def main(argv=None):
         name = sd.name.replace("_Destripe_DONE", "")
         name = "_".join(name.split("_")[4:]) or name     # drop the acquisition date/time prefix
         maps[name] = tifffile.imread(f).astype(np.float32)
+        # side decision on the sum-preserving map (count / sum) when there is one
+        side_f = a_dir / args.map.replace("_fraction_", "_count_").replace("_mean_", "_sum_")
+        lo, hi = side_totals(tifffile.imread(side_f) if side_f.is_file() and side_f != f else maps[name],
+                             lr_axis, centre)
+        sides[name] = {"low": lo, "high": hi, "strong": "high" if hi > lo else "low",
+                       "ratio": round(max(lo, hi) / max(min(lo, hi), 1e-12), 2),
+                       "decided_on": side_f.name if side_f.is_file() else f.name}
         if ref_orient is None:
             info = json.loads((a_dir / "atlas_space.json").read_text())
             ref_orient = info["reference_orientation_to_ccf"]
@@ -276,6 +407,28 @@ def main(argv=None):
     for n, m in maps.items():
         if m.shape != shape:
             raise SystemExit(f"{n}: map {m.shape} differs from {shape}")
+    if ref.shape != shape:
+        raise SystemExit(f"reference {ref.shape} differs from the maps {shape}")
+
+    # left/right alignment
+    if args.align_side == "auto":
+        votes = [s["strong"] for s in sides.values()]
+        target = "high" if votes.count("high") > votes.count("low") else "low"
+    else:
+        target = args.align_side
+    flipped = {}
+    for n in maps:
+        forced = ("flip" if any(t.lower() in n.lower() for t in args.flip)
+                  else "keep" if any(t.lower() in n.lower() for t in args.keep) else None)
+        do = forced == "flip" or (forced is None and target != "none" and sides[n]["strong"] != target)
+        flipped[n] = do
+        why = f"forced ({forced})" if forced else "automatic" if target != "none" else "off"
+        logger.info(f"{n}: signal low/high side {sides[n]['low']:.4g} / {sides[n]['high']:.4g} "
+                    f"(x{sides[n]['ratio']}), mirrored: {'yes' if do else 'no'} [{why}]")
+        if forced is None and target != "none" and sides[n]["ratio"] < 1.3:
+            logger.warning(f"{n}: the two sides differ by less than 30%; check this brain's mirroring")
+        if do:
+            maps[n] = mirror(maps[n], lr_axis, centre)
     for n, m in maps.items():
         write_ome_zarr(work / "samples" / f"{n}.ome.zarr", m, vox, name=n)
 
@@ -298,9 +451,6 @@ def main(argv=None):
         diff = (a, b)
 
     # background and regions, in the reference tif's own axis order
-    ref = read_any(args.reference, labels=True)
-    if ref.shape != shape:
-        raise SystemExit(f"reference {ref.shape} differs from the maps {shape}")
     tmpl = invert_orient(ants.image_read(ccf_path).numpy(), ref_orient["perm"], ref_orient["flips"])
     write_ome_zarr(work / "template.ome.zarr", np.ascontiguousarray(tmpl), vox, name="CCF template")
     write_ome_zarr(work / "regions.ome.zarr", ref, vox, labels=True, name="regions")
@@ -318,7 +468,11 @@ def main(argv=None):
     desc = (f"{len(maps)} brains, map {args.map}, groups: "
             + ", ".join(f"{g} (n={len(m)})" for g, m in cfg["groups"].items())
             + f"; colour range 0 to {rng[1]:.3g}")
-    (work / "views.json").write_text(json.dumps({"description": desc, "titles": titles, "views": views(cfg)}, indent=1))
+    hemis = {"axis": "zyx"[lr_axis], "axis_index": lr_axis, "centre": centre, "target": target,
+             "dimensions": {a: [vox[i] * 1e-6, "m"] for i, a in enumerate("zyx")},
+             "brains": {n: {**sides[n], "mirrored": flipped[n]} for n in maps}}
+    (work / "views.json").write_text(json.dumps({"description": desc, "titles": titles, "views": views(cfg),
+                                                 "hemispheres": hemis}, indent=1))
     (work / "index.html").write_text(INDEX_HTML, encoding="utf-8")
     if work != out:
         shutil.copytree(work, out, dirs_exist_ok=True)
