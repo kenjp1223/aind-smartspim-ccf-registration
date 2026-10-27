@@ -151,7 +151,7 @@ def compact(arr):
     return inv.reshape(arr.shape).astype(np.float32), ids
 
 
-def ccf_to_template(img_ccf, reg):
+def ccf_to_template(img_ccf, reg, interpolator="genericLabel"):
     """CCF-space label image -> SmartSPIM template space (AIND's reverse transform, labels kept)."""
     import ants
 
@@ -162,7 +162,7 @@ def ccf_to_template(img_ccf, reg):
                          f"other AIND files; the registration used {c2t}. Download it and re-run "
                          f"run_custom_atlas.py --aind-template (registration is reused).")
     return ants.apply_transforms(fixed=tmpl, moving=img_ccf, transformlist=c2t,
-                                 whichtoinvert=[True, False], interpolator="genericLabel")
+                                 whichtoinvert=[True, False], interpolator=interpolator)
 
 
 def template_space_labels(name, label_path, reg, cache_dir):
@@ -238,7 +238,7 @@ def check_transforms(reg, allen_dir):
 # --------------------------------------------------------------------------
 # brain side
 # --------------------------------------------------------------------------
-def to_sample_grid(img_t, reg, reg_dir, grid_shape):
+def to_sample_grid(img_t, reg, reg_dir, grid_shape, interpolator="genericLabel"):
     """Template-space label image -> this brain's registration grid, in the zarr's own axis order."""
     import ants
     from aind_ccf_reg.utils import check_orientation, rotate_image
@@ -251,7 +251,7 @@ def to_sample_grid(img_t, reg, reg_dir, grid_shape):
     fixed = ants.from_numpy(rot, spacing=tuple(ap["spacing"][s] for s in order))
     fixed.set_direction(tmpl.direction)
     fixed.set_origin(tmpl.origin)
-    moved = ants.apply_transforms(fixed=fixed, moving=img_t, interpolator="genericLabel",
+    moved = ants.apply_transforms(fixed=fixed, moving=img_t, interpolator=interpolator,
                                   transformlist=[str(reg_dir / LS_AFFINE), str(reg_dir / LS_INVERSE_WARP)],
                                   whichtoinvert=[True, False])
     back, _ = rotate_image(moved.numpy(), in_mat, reverse=True)
@@ -276,8 +276,9 @@ def block_sums(zarr_path, grid_shape, grid_um, kind, threshold, level=None):
     thr = threshold * (255.0 if rd.dtype == np.uint8 else 1.0)
     logger.info(f"{Path(zarr_path).name}: level {p} {rd.shape} @ {sp} um, {rd.dtype}, blocks {f}"
                 + (f", counting values >= {thr:g}" if kind == "seg" else ", summing values"))
-    sums = np.zeros(grid_shape, np.float64)
-    nvox = np.zeros(grid_shape, np.int64)
+    # float32 holds every block total exactly (at most 64 voxels x 65535 < 2**24); halves memory
+    sums = np.zeros(grid_shape, np.float32)
+    nvox = np.zeros(grid_shape, np.int32)
     step = int(np.lcm(rd.outer[0], f[0]))
     rows = rd.slab_rows()
     groups = {}
