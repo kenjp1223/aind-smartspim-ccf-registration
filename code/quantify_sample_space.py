@@ -62,12 +62,14 @@ from quantify_registered import (
     apply_orient,
     block_factors,
     dice_mask,
+    invert_orient,
     is_network,
     match_orientation,
     ome_levels,
     read_any,
     read_names,
     small_int,
+    warp_to_atlas,
 )
 
 logger = logging.getLogger("sample_space")
@@ -326,6 +328,80 @@ def region_rows(labels, hemi, sums, nvox, ids, names, kind, voxel_mm3):
     return rows
 
 
+def level_transform(zarr_root, level_path):
+    """(scale, translation) in um of one level of an OME-Zarr 0.5 multiscale."""
+    meta = json.loads((Path(zarr_root) / "zarr.json").read_text())
+    attrs = meta.get("attributes", {})
+    ms = attrs.get("ome", attrs)["multiscales"][0]
+    for ds in ms["datasets"]:
+        if str(ds["path"]) == str(level_path):
+            sc = next(t["scale"] for t in ds["coordinateTransformations"] if t["type"] == "scale")
+            tr = next((t["translation"] for t in ds["coordinateTransformations"] if t["type"] == "translation"),
+                      [0.0] * len(sc))
+            return [float(x) for x in sc[-3:]], [float(x) for x in tr[-3:]]
+    raise ValueError(f"level {level_path} not in {zarr_root}")
+
+
+def write_label_zarr(path, labels, scale, translation, names, ids_present):
+    """
+    Labels as an OME-Zarr 0.5 (Zarr v3) segmentation that Neuroglancer reads:
+    uint32, 64^3 chunks, blosc-zstd, pyramid by 2x subsampling (labels are
+    picked, never averaged). scale/translation (um, z y x) put it exactly on
+    the raw channel's grid. Region names go in <zarr>/segment_properties/info
+    (Neuroglancer's segment-properties format; zarr readers ignore it).
+    """
+    import tensorstore as ts
+
+    path = Path(path)
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True)
+    datasets = []
+    level, arr, sc = 0, np.ascontiguousarray(labels.astype(np.uint32)), list(scale)
+    while True:
+        spec = {
+            "driver": "zarr3",
+            "kvstore": {"driver": "file", "path": str((path / str(level)).resolve()).replace("\\", "/")},
+            "metadata": {
+                "shape": list(arr.shape),
+                "data_type": "uint32",
+                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [64, 64, 64]}},
+                "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+                "codecs": [{"name": "bytes", "configuration": {"endian": "little"}},
+                           {"name": "blosc", "configuration": {"cname": "zstd", "clevel": 5,
+                                                               "shuffle": "shuffle", "typesize": 4,
+                                                               "blocksize": 0}}],
+                "dimension_names": ["z", "y", "x"],
+                "fill_value": 0,
+            },
+            "create": True, "delete_existing": True,
+        }
+        ts.open(spec).result().write(arr).result()
+        datasets.append({"path": str(level), "coordinateTransformations": [
+            {"type": "scale", "scale": [round(x, 6) for x in sc]},
+            {"type": "translation", "translation": [round(x, 6) for x in translation]}]})
+        if max(arr.shape) <= 64:
+            break
+        # every 2nd voxel: centres stay on the same grid, so the translation is unchanged
+        arr, sc, level = np.ascontiguousarray(arr[::2, ::2, ::2]), [x * 2 for x in sc], level + 1
+    group = {"zarr_format": 3, "node_type": "group", "attributes": {"ome": {"version": "0.5", "multiscales": [{
+        "name": path.name.replace(".ome.zarr", ""),
+        "axes": [{"name": a, "type": "space", "unit": "micrometer"} for a in "zyx"],
+        "datasets": datasets, "type": "nearest"}]}}}
+    (path / "zarr.json").write_text(json.dumps(group, indent=1))
+    present = [int(i) for i in ids_present if i]
+    props = {"@type": "neuroglancer_segment_properties", "inline": {
+        "ids": [str(i) for i in present],
+        "properties": [
+            {"id": "label", "type": "label", "values": [names.get(str(i), (str(i), ""))[0] or str(i) for i in present]},
+            {"id": "description", "type": "description",
+             "values": [f"{names.get(str(i), ('', ''))[1] or names.get(str(i), (str(i), ''))[0]} (id {i})" for i in present]},
+        ]}}
+    (path / "segment_properties").mkdir()
+    (path / "segment_properties" / "info").write_text(json.dumps(props))
+    return len(datasets)
+
+
 def write_csv(path, rows, lead):
     if not rows:
         return
@@ -374,8 +450,14 @@ def quantify_one(sample, args, label_sets, names):
             hemi[labels == 0] = 0
             logger.info(f"{sample.name}: {lname} labels on the registration grid {grid_shape}: "
                         f"{len(np.unique(labels)) - 1} regions present ({time.time() - t0:.0f} s)")
-            tifffile.imwrite(work / f"{lname}_labels_regrid.tif", ids[labels].astype(np.uint32), compression="zlib")
+            atlas_ids = ids[labels].astype(np.uint32)
+            tifffile.imwrite(work / f"{lname}_labels_regrid.tif", atlas_ids, compression="zlib")
             tifffile.imwrite(work / "hemisphere_regrid.tif", hemi.astype(np.uint8), compression="zlib")
+            sc, tr = level_transform(grid_path.parent, grid_path.name)
+            n_lv = write_label_zarr(work / f"{lname}_labels.ome.zarr", atlas_ids, sc, tr,
+                                    names.get(lname, {}), ids[np.unique(labels)])
+            logger.info(f"{sample.name}: wrote {lname}_labels.ome.zarr ({n_lv} levels, on the raw grid: "
+                        f"scale {sc} um, translation {tr} um)")
             summary = {"sample": str(sample), "labels": lname, "label_file": str(lpath),
                        "registration_grid": {"shape": list(grid_shape), "voxel_um": list(grid_um),
                                              "zarr_level": str(grid_path)},
@@ -393,6 +475,16 @@ def quantify_one(sample, args, label_sets, names):
                 label = ch.replace(".ome.zarr", "").replace(".zarr", "")
                 write_csv(work / f"{label}_regions.csv", rows,
                           {"sample": sample.name, "channel": label, "labels": lname})
+                # maps on the registration grid (16 um here; mean intensity / positive fraction)
+                kind_map = "fraction" if kind == "seg" else "mean"
+                regrid = np.divide(sums, nvox, out=np.zeros(sums.shape), where=nvox > 0).astype(np.float32)
+                tifffile.imwrite(work / f"{label}_{kind_map}_regrid.tif", regrid, compression="zlib")
+                if not args.no_atlas_maps:
+                    # warped to CCF (linear), in the label file's own array order and size
+                    o = linfo["orientation_to_ccf"]
+                    atlas_map = invert_orient(warp_to_atlas(regrid, reg, reg_dir), o["perm"], o["flips"])
+                    tifffile.imwrite(work / f"{label}_{kind_map}_ccf25.tif",
+                                     np.ascontiguousarray(atlas_map).astype(np.float32), compression="zlib")
                 outside = float(sums[labels == 0].sum())
                 cinfo.update(kind=kind, rows=len(rows), total=float(sums.sum()), outside_atlas=outside)
                 summary["channels"][ch] = cinfo
@@ -423,6 +515,8 @@ def main(argv=None):
     ap.add_argument("--threshold", type=float, default=0.5, help="seg probability threshold (0-1)")
     ap.add_argument("--level", help="zarr level to quantify (default: finest)")
     ap.add_argument("--summary", help="folder for CSVs combining all samples")
+    ap.add_argument("--no-atlas-maps", action="store_true",
+                    help="skip the signal maps warped to CCF 25 um (<channel>_*_ccf25.tif)")
     ap.add_argument("--cache", default=str(Path(tempfile.gettempdir()) / "ccfreg_label_cache"),
                     help="where template-space labels are cached (default: %(default)s)")
     ap.add_argument("--check-transforms", metavar="ALLEN_DIR",
