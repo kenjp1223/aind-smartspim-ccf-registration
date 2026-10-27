@@ -62,6 +62,20 @@ DEFAULT_SAMPLE_AXES = "inferior_to_superior,anterior_to_posterior,left_to_right"
 # Coronal atlas stack read as (plane, row, column)
 DEFAULT_ATLAS_AXES = "anterior_to_posterior,superior_to_inferior,left_to_right"
 # (the Allen CCF .nrrd files are stored the same way: AP, DV, LR)
+
+# AIND's SmartSPIM template set (s3://aind-open-data/SmartSPIM-template_2024-05-16_11-26-14)
+AIND_FILES = {
+    "template": "smartspim_lca_template_25.nii.gz",
+    "ccf": "ccf_average_template_25.nii.gz",
+    "labels": "ccf_annotation_to_template_moved_25.nii.gz",
+    "affine": "spim_template_to_ccf_syn_0GenericAffine_25.mat",
+    "warp": "spim_template_to_ccf_syn_1Warp_25.nii.gz",
+    "inverse_warp": "spim_template_to_ccf_syn_1InverseWarp_25.nii.gz",
+}
+# array axes of the AIND template as ANTs loads it (from AIND's main.py)
+AIND_TEMPLATE_ORIENTATIONS = {"right_to_left": 0, "anterior_to_posterior": 1, "superior_to_inferior": 2}
+# --syn-smooth: a more regularised SyN for cross-modality (light-sheet -> Allen STPT)
+SMOOTH_SYN = {"syn_sampling": 4, "total_sigma": 1.0, "grad_step": 0.1}
 CCF_ANNOTATION_MAP = Path(__file__).resolve().parent / "aind_ccf_reg" / "ccf_files" / "annotation_map.json"
 
 logger = logging.getLogger("run_custom_atlas")
@@ -338,6 +352,27 @@ def read_regions(csv_path, id_col=None, name_col=None, desc_col=None):
     return acr, desc
 
 
+def compact_labels_keep_header(src, dst):
+    """
+    Like atlas_to_nifti(labels=True), for a NIfTI that must keep its physical
+    space (origin / direction) because fixed transforms refer to it.
+    """
+    import ants
+
+    img = ants.image_read(str(src), pixeltype="unsigned int")
+    arr = img.numpy().astype(np.uint64)
+    ids, compact = np.unique(arr, return_inverse=True)
+    if ids[0] != 0:
+        ids = np.concatenate([[0], ids])
+        compact = compact + 1
+    out = ants.from_numpy(
+        compact.reshape(arr.shape).astype(np.float32),
+        origin=img.origin, spacing=img.spacing, direction=img.direction,
+    )
+    ants.image_write(out, str(dst))
+    return arr.shape, {i: int(a) for i, a in enumerate(ids)}
+
+
 def write_identity(path):
     import ants
 
@@ -495,67 +530,8 @@ def deliver(work, final, on_network, cleanup=True):
         shutil.rmtree(work.parent, ignore_errors=True)
 
 
-# --------------------------------------------------------------------------
-def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("zarr", help="channel OME-Zarr, e.g. ...\\Ex_488_Ch0_stitched.ome.zarr")
-    ap.add_argument("--atlas-template", required=True, help="atlas template volume (tif or nii)")
-    ap.add_argument("--atlas-labels", required=True, help="atlas label volume, same grid")
-    ap.add_argument("--atlas-info", default=str(CCF_ANNOTATION_MAP),
-                    help="CSV (id, acronym, name) or JSON {id: acronym} for the label IDs "
-                         "(default: the repo's Allen CCF annotation_map.json)")
-    ap.add_argument("--atlas-res", type=float, nargs="+", metavar="UM",
-                    help="atlas voxel size in um: one value (isotropic) or three for "
-                         "array axes 0 1 2, i.e. the tif's z y x (e.g. 50 20 20 for 50 um "
-                         "coronal sections at 20 um in-plane)")
-    ap.add_argument("--atlas-axes", default=DEFAULT_ATLAS_AXES,
-                    help=f"directions of atlas array axes 0,1,2 (default {DEFAULT_ATLAS_AXES})")
-    ap.add_argument("--sample-axes", default=DEFAULT_SAMPLE_AXES,
-                    help=f"directions of zarr axes z,y,x (default {DEFAULT_SAMPLE_AXES})")
-    ap.add_argument("--level", help="zarr level to register (default: coarsest not coarser than atlas)")
-    ap.add_argument("--out", help="output folder (default: <sample>/registration_<atlas>/<channel>)")
-    ap.add_argument("--id-col"), ap.add_argument("--name-col"), ap.add_argument("--desc-col")
-    ap.add_argument("--syn-iterations", help="e.g. 200,100,25,3")
-    ap.add_argument("--redo", action="store_true",
-                    help="recompute the registration even if transforms from an earlier run exist")
-    ap.add_argument("--check", action="store_true",
-                    help="only write orientation_check.png and the plan; no registration")
-    args = ap.parse_args(argv)
-
-    zarr_path = Path(args.zarr.rstrip("/\\"))
-    if not zarr_path.is_dir():
-        raise SystemExit(f"Not found: {zarr_path}")
-    channel = zarr_path.name
-    for suf in (".ome.zarr", ".zarr"):
-        if channel.endswith(suf):
-            channel = channel[: -len(suf)]
-            break
-    atlas_name = Path(args.atlas_template).stem.split(".")[0]
-
-    out = Path(args.out) if args.out else zarr_path.parent / f"registration_{atlas_name}" / channel
-    out = out.resolve()
-    out.mkdir(parents=True, exist_ok=True)
-    (out / "atlas").mkdir(exist_ok=True)
-
-    setup_logging(out)
-
-    # tensorstore and CloudVolume can't write to Windows network (UNC) paths,
-    # so a network output folder is produced locally and copied over at the end.
-    final = out
-    on_network = str(final).startswith(("\\\\", "//"))
-    if on_network:
-        import tempfile
-
-        out = Path(tempfile.mkdtemp(prefix="ccfreg_")) / final.name
-        (out / "atlas").mkdir(parents=True)
-        logger.info(f"Output is on a network path: working in {out}, copying to {final} at the end")
-
-    sample_dirs = parse_axes(args.sample_axes)
-    atlas_dirs = parse_axes(args.atlas_axes)
-    tmpl_orient = template_orientations(atlas_dirs, sample_dirs)
-    sample_axes = sample_orientation(sample_dirs)
-
-    # ---- atlas -> NIfTI (once per output folder) ----
+def prepare_atlas(args, out, lab_nii):
+    """Custom-atlas route: template and compact labels as NIfTI in out/atlas."""
     tmpl_src = Path(args.atlas_template)
     if args.atlas_res is None:
         if tmpl_src.suffix.lower() in (".tif", ".tiff"):
@@ -582,15 +558,120 @@ def main(argv=None):
         atlas_sp_mm = tuple(r / 1000.0 for r in args.atlas_res)
     else:
         raise SystemExit("--atlas-res takes one value or three (z y x of the atlas tif)")
-    atlas_res_mm = min(atlas_sp_mm)  # finest axis: decides which zarr level to use
     tmpl_nii = out / "atlas" / "template.nii.gz"
-    lab_nii = out / "atlas" / "labels.nii.gz"
     tshape, _ = atlas_to_nifti(tmpl_src, tmpl_nii, atlas_sp_mm)
     lshape, id_map = atlas_to_nifti(args.atlas_labels, lab_nii, atlas_sp_mm, labels=True)
     if tshape != lshape:
         raise SystemExit(f"Template {tshape} and labels {lshape} are not the same grid")
+    return atlas_sp_mm, tmpl_nii, tshape, id_map
+
+
+# --------------------------------------------------------------------------
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("zarr", help="channel OME-Zarr, e.g. ...\\Ex_488_Ch0_stitched.ome.zarr")
+    ap.add_argument("--aind-template", metavar="DIR",
+                    help="AIND two-step route to Allen CCF: folder with AIND's SmartSPIM template "
+                         "files (smartspim_lca_template_25.nii.gz, spim_template_to_ccf_syn_*, "
+                         "ccf_average_template_25.nii.gz, ccf_annotation_to_template_moved_25.nii.gz). "
+                         "Replaces --atlas-template/--atlas-labels.")
+    ap.add_argument("--atlas-template", help="atlas template volume (tif, nrrd or nii)")
+    ap.add_argument("--atlas-labels", help="atlas label volume, same grid")
+    ap.add_argument("--atlas-info", default=str(CCF_ANNOTATION_MAP),
+                    help="CSV (id, acronym, name) or JSON {id: acronym} for the label IDs "
+                         "(default: the repo's Allen CCF annotation_map.json)")
+    ap.add_argument("--atlas-res", type=float, nargs="+", metavar="UM",
+                    help="atlas voxel size in um: one value (isotropic) or three for "
+                         "array axes 0 1 2, i.e. the tif's z y x (e.g. 50 20 20 for 50 um "
+                         "coronal sections at 20 um in-plane)")
+    ap.add_argument("--atlas-axes", default=None,
+                    help=f"directions of atlas array axes 0,1,2 (default {DEFAULT_ATLAS_AXES})")
+    ap.add_argument("--sample-axes", default=DEFAULT_SAMPLE_AXES,
+                    help=f"directions of zarr axes z,y,x (default {DEFAULT_SAMPLE_AXES})")
+    ap.add_argument("--level", help="zarr level to register (default: coarsest not coarser than atlas)")
+    ap.add_argument("--out", help="output folder (default: <sample>/registration_<atlas>/<channel>)")
+    ap.add_argument("--id-col"), ap.add_argument("--name-col"), ap.add_argument("--desc-col")
+    ap.add_argument("--syn-iterations", help="e.g. 200,100,25,3")
+    ap.add_argument("--syn-smooth", action="store_true",
+                    help=f"more regularised SyN {SMOOTH_SYN} (direct registration to a "
+                         "template of another modality)")
+    ap.add_argument("--redo", action="store_true",
+                    help="recompute the registration even if transforms from an earlier run exist")
+    ap.add_argument("--check", action="store_true",
+                    help="only write orientation_check.png and the plan; no registration")
+    args = ap.parse_args(argv)
+
+    zarr_path = Path(args.zarr.rstrip("/\\"))
+    if not zarr_path.is_dir():
+        raise SystemExit(f"Not found: {zarr_path}")
+    channel = zarr_path.name
+    for suf in (".ome.zarr", ".zarr"):
+        if channel.endswith(suf):
+            channel = channel[: -len(suf)]
+            break
+    if args.aind_template:
+        atlas_name = "ccf25_aind"
+    elif args.atlas_template and args.atlas_labels:
+        atlas_name = Path(args.atlas_template).stem.split(".")[0]
+    else:
+        raise SystemExit("Give --aind-template DIR, or --atlas-template and --atlas-labels")
+
+    out = Path(args.out) if args.out else zarr_path.parent / f"registration_{atlas_name}" / channel
+    out = out.resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "atlas").mkdir(exist_ok=True)
+
+    setup_logging(out)
+
+    # tensorstore and CloudVolume can't write to Windows network (UNC) paths,
+    # so a network output folder is produced locally and copied over at the end.
+    final = out
+    on_network = str(final).startswith(("\\\\", "//"))
+    if on_network:
+        import tempfile
+
+        out = Path(tempfile.mkdtemp(prefix="ccfreg_")) / final.name
+        (out / "atlas").mkdir(parents=True)
+        logger.info(f"Output is on a network path: working in {out}, copying to {final} at the end")
+
+    sample_dirs = parse_axes(args.sample_axes)
+    if args.aind_template and not args.atlas_axes:
+        atlas_dirs = sorted(AIND_TEMPLATE_ORIENTATIONS, key=AIND_TEMPLATE_ORIENTATIONS.get)
+    else:
+        atlas_dirs = parse_axes(args.atlas_axes or DEFAULT_ATLAS_AXES)
+    tmpl_orient = template_orientations(atlas_dirs, sample_dirs)
+    sample_axes = sample_orientation(sample_dirs)
+
     identity = out / "atlas" / "identity.mat"
     write_identity(identity)
+    lab_nii = out / "atlas" / "labels.nii.gz"
+    if args.aind_template:
+        # ---- AIND route: brain -> SmartSPIM template (registered here), then
+        # AIND's fixed template -> CCF transform. Their files keep their own
+        # physical space (the fixed transforms refer to it).
+        import ants
+
+        adir = Path(args.aind_template)
+        af = {k: adir / v for k, v in AIND_FILES.items()}
+        need = [k for k in ("template", "ccf", "labels", "affine", "warp") if not af[k].is_file()]
+        if need:
+            raise SystemExit(f"Missing in {adir}: " + ", ".join(AIND_FILES[k] for k in need))
+        tmpl_nii = af["template"]
+        ccf_ref = af["ccf"]
+        t2c = [str(af["warp"]), str(af["affine"])]
+        inv = af["inverse_warp"] if af["inverse_warp"].is_file() else af["warp"]
+        c2t = [str(af["affine"]), str(inv)]  # only used by AIND's reverse_atlas_alignment
+        hdr = ants.image_header_info(str(tmpl_nii))
+        atlas_sp_mm = tuple(float(x) for x in hdr["spacing"])
+        tshape = tuple(int(x) for x in hdr["dimensions"])
+        _, id_map = compact_labels_keep_header(af["labels"], lab_nii)
+        out_voxel = None  # brain in CCF space: CCF 25 um grid
+        logger.info(f"AIND route: {tmpl_nii.name} {tshape} @ {atlas_sp_mm} mm -> CCF via fixed transforms")
+    else:
+        atlas_sp_mm, tmpl_nii, tshape, id_map = prepare_atlas(args, out, lab_nii)
+        ccf_ref, t2c, c2t = tmpl_nii, [str(identity)], [str(identity)]
+        out_voxel = tuple(s * 1000 for s in atlas_sp_mm[::-1])
+    atlas_res_mm = min(atlas_sp_mm)  # finest axis: decides which zarr level to use
     names, full = read_regions(args.atlas_info, args.id_col, args.name_col, args.desc_col)
     # Region tables keyed by the compact index used in the warped label volume
     acr, desc = {}, {}
@@ -636,9 +717,9 @@ def main(argv=None):
         "input_orientation": sample_axes,
         "bucket_path": "local",
         "template_path": str(tmpl_nii),
-        "ccf_reference_path": str(tmpl_nii),
-        "template_to_ccf_transform_path": [str(identity)],
-        "ccf_to_template_transform_path": [str(identity)],
+        "ccf_reference_path": str(ccf_ref),
+        "template_to_ccf_transform_path": t2c,
+        "ccf_to_template_transform_path": c2t,
         "ccf_annotation_to_template_moved_path": str(lab_nii),
         "reference_res": reference_res,
         "output_data": str(out / "OMEZarr"),
@@ -672,8 +753,8 @@ def main(argv=None):
             "ccf_anno_to_brain_path": str(reg_folder / "moved_ccf_anno_to_ls.nii.gz"),
             # voxel size (um) of OMEZarr/image.zarr (the brain in atlas space).
             # register.run writes the atlas-grid array with its axes reversed,
-            # so the sizes go in reverse atlas-axis order.
-            "output_voxel_size": tuple(s * 1000 for s in atlas_sp_mm[::-1]),
+            # so the sizes go in reverse atlas-axis order. None: reference_res.
+            "output_voxel_size": out_voxel,
         },
         "OMEZarr_params": {
             "clevel": 1,
@@ -697,6 +778,8 @@ def main(argv=None):
             },
         },
     }
+    if args.syn_smooth:
+        cfg["ants_params"]["syn_extra"] = dict(SMOOTH_SYN)
     if args.syn_iterations:
         cfg["ants_params"]["syn_iterations"] = [int(x) for x in args.syn_iterations.split(",")]
 

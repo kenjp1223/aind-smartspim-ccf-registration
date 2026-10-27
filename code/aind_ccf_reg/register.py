@@ -350,6 +350,8 @@ class Register(ArgSchemaParser):
             "outprefix": f"{self.args['results_folder']}/ls_to_template_SyN_",
             "verbose": True,
         }
+        # optional overrides, e.g. {"total_sigma": 1.0, "syn_sampling": 4}
+        registration_params.update(self.args["ants_params"].get("syn_extra") or {})
 
         logger.info(f"Computing SyN registration with parameters: {registration_params}")
         reg = ants.registration(**registration_params)
