@@ -432,8 +432,8 @@ def quantify_one(sample, args, label_sets, names):
     grid_shape = tuple(json.loads((grid_path / "zarr.json").read_text())["shape"])
     grid_um = tuple(s * 1000 for s in reg["ants_params"]["spacing"])
     reg_channel = Path(reg.get("sources", {}).get("zarr", grid_path.parent)).name
-    channels = args.channels or default_channels(sample, reg_channel)
-    if not channels:
+    channels = [] if args.labels_only else (args.channels or default_channels(sample, reg_channel))
+    if not channels and not args.labels_only:
         raise RuntimeError("no channels to quantify (no seg-*.zarr; use --channels)")
     results = {}
     for lname, (lpath, _) in label_sets.items():
@@ -493,7 +493,8 @@ def quantify_one(sample, args, label_sets, names):
                             f"{outside / max(float(sums.sum()), 1e-12) * 100:.1f}%")
                 results.setdefault((lname, kind), []).extend(
                     {"sample": sample.name, "channel": label, "labels": lname, **r} for r in rows)
-            (work / "quantification.json").write_text(json.dumps(summary, indent=2, default=str))
+            if not args.labels_only:  # --labels-only keeps the existing quantification.json
+                (work / "quantification.json").write_text(json.dumps(summary, indent=2, default=str))
         finally:
             logging.getLogger().removeHandler(fh)
             fh.close()
@@ -515,6 +516,9 @@ def main(argv=None):
     ap.add_argument("--threshold", type=float, default=0.5, help="seg probability threshold (0-1)")
     ap.add_argument("--level", help="zarr level to quantify (default: finest)")
     ap.add_argument("--summary", help="folder for CSVs combining all samples")
+    ap.add_argument("--labels-only", action="store_true",
+                    help="only write the warped labels (label zarr + tifs); no channel reading, "
+                         "existing region tables and quantification.json are left as they are")
     ap.add_argument("--no-atlas-maps", action="store_true",
                     help="skip the signal maps warped to CCF 25 um (<channel>_*_ccf25.tif)")
     ap.add_argument("--cache", default=str(Path(tempfile.gettempdir()) / "ccfreg_label_cache"),
