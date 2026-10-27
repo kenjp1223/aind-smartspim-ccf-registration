@@ -306,9 +306,8 @@ function render() {
     const st = JSON.parse(JSON.stringify(st0).split("{BASE}").join(BASE));
     for (const l of st.layers) {
       if (typeof l.source !== "string") continue;
-      for (const b of extra) {
-        if (l.source.endsWith("/samples/" + b + ".ome.zarr")) l.source = mirrored(l.source, V.hemispheres);
-      }
+      const b = l.source.match(/\\/samples\\/([^/]+)\\.ome\\.zarr$/);
+      if (b && extra.has(b[1])) l.source = mirrored(l.source, V.hemispheres);
     }
     const li = document.createElement("li"), a = document.createElement("a");
     a.href = location.origin + "/ng/#!" + encodeURIComponent(JSON.stringify(st));
