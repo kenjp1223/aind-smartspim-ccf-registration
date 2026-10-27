@@ -282,6 +282,7 @@ td,th{padding:.25em .8em;border-bottom:1px solid #333;text-align:left}th{color:#
 Toggle layers by clicking their tab; change contrast in the layer's panel (double-click the tab).</p>
 <h3>Left / right</h3>
 <p id=hinfo class=note></p>
+<p id=stale style="color:#fc9"></p>
 <table id=brains><tr><th>brain</th><th>signal low / high side</th><th>mirrored at build</th><th>mirror now</th></tr></table>
 <p class=note>"Mirror now" flips that brain's own layers in the links above (tick, then open a view).
 Group means and the difference keep the build-time choice; to change them, rebuild with
@@ -299,15 +300,37 @@ function mirrored(src, h) {
   return {url: src, transform: {outputDimensions: h.dimensions, matrix: M}};
 }
 
+const sampleOf = src => { const m = typeof src === "string" && src.match(/\\/samples\\/([^/]+)\\.ome\\.zarr$/); return m && m[1]; };
+const groupOf = src => { const m = typeof src === "string" && src.match(/\\/groups\\/(.+)_mean\\.ome\\.zarr$/); return m && m[1]; };
+
+function groupMembers() {
+  // group -> brains, read from the side-by-side view's "<group>: <brain>" layers
+  const g = {};
+  for (const l of (V.views.side_by_side || {layers: []}).layers) {
+    const s = sampleOf(l.source), i = l.name.indexOf(": ");
+    if (s && i > 0) (g[l.name.slice(0, i)] = g[l.name.slice(0, i)] || []).push(s);
+  }
+  return g;
+}
+
 function render() {
   const ul = document.getElementById("views");
   ul.innerHTML = "";
+  // groups with a manually mirrored brain: their build-time mean is out of date
+  const members = groupMembers();
+  const stale = new Set(Object.keys(members).filter(g => members[g].some(s => extra.has(s))));
+  const note = document.getElementById("stale");
+  note.textContent = stale.size ? `Mean of ${[...stale].join(", ")} hidden (built without this mirroring); ` +
+    "their brains are shown one by one instead. The difference map is hidden too." : "";
   for (const [name, st0] of Object.entries(V.views)) {
     const st = JSON.parse(JSON.stringify(st0).split("{BASE}").join(BASE));
     for (const l of st.layers) {
-      if (typeof l.source !== "string") continue;
-      const b = l.source.match(/\\/samples\\/([^/]+)\\.ome\\.zarr$/);
-      if (b && extra.has(b[1])) l.source = mirrored(l.source, V.hemispheres);
+      const s = sampleOf(l.source), g = groupOf(l.source);
+      if (s && extra.has(s)) l.source = mirrored(l.source, V.hemispheres);
+      if (!stale.size) continue;
+      if (g && stale.has(g)) l.visible = false;
+      if (typeof l.source === "string" && l.source.includes("_minus_")) l.visible = false;
+      if (s && [...stale].some(k => members[k].includes(s))) l.visible = true;
     }
     const li = document.createElement("li"), a = document.createElement("a");
     a.href = location.origin + "/ng/#!" + encodeURIComponent(JSON.stringify(st));
