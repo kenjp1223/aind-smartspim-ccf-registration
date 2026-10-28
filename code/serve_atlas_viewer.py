@@ -22,14 +22,32 @@ import functools
 import html
 import http.server
 import os
+import posixpath
 import re
 import socket
 import sys
 import threading
 import webbrowser
 from pathlib import Path
+from urllib.parse import unquote
 
 DEFAULT_CLIENT = Path(__file__).resolve().parents[2] / "neuroglancer-catalog" / "catalog" / "neuroglancer_client"
+
+
+def safe_join(base, url_rest):
+    """Map the URL portion after a mount prefix to a file under `base`, with no escape.
+
+    Decodes %xx, collapses '.'/'..' against a leading '/' so nothing can climb above
+    the mount, then confirms the real path stays inside `base` (also stops symlinks
+    inside the folder from pointing out). Returns None if it would escape.
+    """
+    rel = unquote(url_rest).split("?", 1)[0].split("#", 1)[0]
+    rel = posixpath.normpath("/" + rel.lstrip("/")).lstrip("/") or "index.html"
+    base_real = os.path.realpath(base)
+    full = os.path.realpath(os.path.join(base_real, *rel.split("/")))
+    if full != base_real and not full.startswith(base_real + os.sep):
+        return None
+    return full
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -40,13 +58,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def translate_path(self, path):
         clean = path.split("?", 1)[0].split("#", 1)[0]
         if clean == "/ng" or clean.startswith("/ng/"):
-            rel = clean[len("/ng"):].lstrip("/") or "index.html"
-            return str(Path(self.client_dir) / rel)
+            return safe_join(self.client_dir, clean[len("/ng"):]) or os.devnull
         # /<slug>/rest  -> that viewer's folder
         m = re.match(r"/([^/]+)(/.*)?$", clean)
         if m and m.group(1) in self.viewers:
-            rest = (m.group(2) or "/").lstrip("/") or "index.html"
-            return str(Path(self.viewers[m.group(1)]) / rest)
+            return safe_join(self.viewers[m.group(1)], m.group(2) or "") or os.devnull
         return super().translate_path(path)
 
     def do_GET(self):
