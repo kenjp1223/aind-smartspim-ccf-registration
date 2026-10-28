@@ -21,6 +21,7 @@ import argparse
 import functools
 import html
 import http.server
+import ipaddress
 import os
 import posixpath
 import re
@@ -54,6 +55,23 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     client_dir = None
     viewers = {}        # slug -> folder path (str)
     landing = b""       # landing-page HTML (empty when only one viewer)
+    allowed_hosts = set()   # extra Host: names to accept besides a bare IP / localhost
+
+    def _host_ok(self):
+        host = self.headers.get("Host", "").rsplit(":", 1)[0].lower().strip("[]")
+        if not host or host == "localhost" or host in self.allowed_hosts:
+            return True
+        try:
+            ipaddress.ip_address(host)   # a literal IP cannot be a DNS-rebinding name
+            return True
+        except ValueError:
+            return False
+
+    def send_head(self):   # both GET and HEAD go through here
+        if not self._host_ok():
+            self.send_error(403, "Forbidden host")
+            return None
+        return super().send_head()
 
     def translate_path(self, path):
         clean = path.split("?", 1)[0].split("#", 1)[0]
@@ -66,6 +84,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         return super().translate_path(path)
 
     def do_GET(self):
+        if not self._host_ok():
+            self.send_error(403, "Forbidden host")
+            return
         clean = self.path.split("?", 1)[0].split("#", 1)[0]
         if self.landing and clean in ("/", "/index.html"):
             self.send_response(200)
@@ -84,6 +105,9 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_OPTIONS(self):
+        if not self._host_ok():
+            self.send_error(403, "Forbidden host")
+            return
         self.send_response(204)
         self.end_headers()
 
@@ -133,6 +157,9 @@ def main(argv=None):
     ap.add_argument("--client", default=str(DEFAULT_CLIENT), help="Neuroglancer app folder (default: %(default)s)")
     ap.add_argument("--port", type=int, default=8091)
     ap.add_argument("--bind", default="0.0.0.0", help="0.0.0.0 = reachable from other stations; 127.0.0.1 = this PC only")
+    ap.add_argument("--allowed-host", action="append", default=[], metavar="NAME",
+                    help="a hostname to accept in the Host: header (a bare IP or localhost is always fine); "
+                         "repeat for several. Blocks DNS-rebinding by a website the viewer opens.")
     ap.add_argument("--no-browser", action="store_true")
     args = ap.parse_args(argv)
 
@@ -157,6 +184,7 @@ def main(argv=None):
 
     host = lan_ip() if args.bind == "0.0.0.0" else "127.0.0.1"
     Handler.client_dir = str(client)
+    Handler.allowed_hosts = {h.lower() for h in args.allowed_host}
 
     if len(viewers) == 1:
         # single viewer served at the root, as before
