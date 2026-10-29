@@ -169,13 +169,13 @@ def ccf_to_template(img_ccf, reg, interpolator="genericLabel"):
                                  whichtoinvert=[True, False], interpolator=interpolator)
 
 
-def template_space_labels(name, label_path, reg, cache_dir):
+def template_space_labels(name, label_path, reg, cache_dir, interpolator="nearestNeighbor"):
     """(labels in template space as compact float image, id table, hemisphere image, info), cached."""
     import ants
 
     ccf_img = ants.image_read(reg["ccf_reference_path"])
     st = Path(label_path).stat()
-    key = hashlib.sha1(f"{Path(label_path).resolve()}|{st.st_size}|{st.st_mtime}|"
+    key = hashlib.sha1(f"{Path(label_path).resolve()}|{st.st_size}|{st.st_mtime}|{interpolator}|"
                        f"{reg['ccf_reference_path']}|{reg['ccf_to_template_transform_path']}".encode()).hexdigest()[:12]
     cdir = Path(cache_dir) / f"{name}_{key}"
     files = [cdir / "labels_template.nii.gz", cdir / "hemisphere_template.nii.gz", cdir / "info.json"]
@@ -190,8 +190,8 @@ def template_space_labels(name, label_path, reg, cache_dir):
     hemi = hemisphere_volume(arr.shape, lr, high_is_left).astype(np.float32)
     hemi[arr == 0] = 0
     hdr = dict(origin=ccf_img.origin, spacing=ccf_img.spacing, direction=ccf_img.direction)
-    lab_t = ccf_to_template(ants.from_numpy(comp, **hdr), reg)
-    hemi_t = ccf_to_template(ants.from_numpy(hemi, **hdr), reg)
+    lab_t = ccf_to_template(ants.from_numpy(comp, **hdr), reg, interpolator)
+    hemi_t = ccf_to_template(ants.from_numpy(hemi, **hdr), reg, "nearestNeighbor")
     cdir.mkdir(parents=True, exist_ok=True)
     ants.image_write(lab_t, str(files[0]))
     ants.image_write(hemi_t, str(files[1]))
@@ -501,9 +501,10 @@ def quantify_one(sample, args, label_sets, names):
         logging.getLogger().addHandler(fh)
         try:
             t0 = time.time()
-            lab_t, ids, hemi_t, linfo = template_space_labels(lname, lpath, reg, args.cache)
-            labels = to_sample_grid(lab_t, reg, reg_dir, grid_shape)
-            hemi = to_sample_grid(hemi_t, reg, reg_dir, grid_shape)
+            interp = args.label_interpolator
+            lab_t, ids, hemi_t, linfo = template_space_labels(lname, lpath, reg, args.cache, interp)
+            labels = to_sample_grid(lab_t, reg, reg_dir, grid_shape, interp)
+            hemi = to_sample_grid(hemi_t, reg, reg_dir, grid_shape, "nearestNeighbor")
             hemi[labels == 0] = 0
             logger.info(f"{sample.name}: {lname} labels on the registration grid {grid_shape}: "
                         f"{len(np.unique(labels)) - 1} regions present ({time.time() - t0:.0f} s)")
@@ -580,6 +581,9 @@ def main(argv=None):
     ap.add_argument("--labels-info", nargs="*", default=[], metavar="NAME=CSV")
     ap.add_argument("--channels", nargs="+", help="zarrs to quantify (default: seg-*.zarr and their raw channels)")
     ap.add_argument("--threshold", type=float, default=0.5, help="seg probability threshold (0-1)")
+    ap.add_argument("--label-interpolator", default="nearestNeighbor", choices=["nearestNeighbor", "genericLabel"],
+                    help="how atlas labels are resampled onto the brain. nearestNeighbor (default) is fast; "
+                         "genericLabel is slower but smooths multi-label boundaries (the old behaviour)")
     ap.add_argument("--level", help="zarr level to quantify (default: finest)")
     ap.add_argument("--summary", help="folder for CSVs combining all samples")
     ap.add_argument("--labels-only", action="store_true",
