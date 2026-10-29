@@ -26,6 +26,10 @@ Steps, per registered sample (run_custom_atlas.py, AIND route):
 Outputs in <registration folder>/sample_space_<labels>/:
   <labels>_labels_regrid.tif     labels on the registration grid (z, y, x of the
                                  zarr level used for registration), atlas IDs
+  <labels>_labels.ome.zarr       labels as an OME-Zarr segmentation (same grid)
+  <labels>_annotation_precomputed/  labels as a Neuroglancer precomputed
+                                 segmentation with region names (what the catalog
+                                 serves; same format as the Allen atlas layer)
   hemisphere_regrid.tif          1 = left, 2 = right (same grid)
   <channel>_regions.csv          one row per region x hemisphere (left/right/both)
   quantification.json, .log
@@ -403,6 +407,58 @@ def write_label_zarr(path, labels, scale, translation, names, ids_present):
     return len(datasets)
 
 
+def _patch_intervaltree_monitor():
+    """cloudfiles' bandwidth monitor makes a zero-width interval when an I/O finishes in under a
+    microsecond (fast local disk); newer intervaltree rejects those and crashes CloudVolume. Skip
+    zero-width adds — they carry no meaningful stats."""
+    try:
+        import intervaltree
+        _orig = intervaltree.IntervalTree.addi
+
+        def addi(self, begin, end, data=None):
+            return None if begin == end else _orig(self, begin, end, data)
+
+        intervaltree.IntervalTree.addi = addi
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def write_label_precomputed(out_dir, labels_zyx, scale_um, names):
+    """
+    Labels as a Neuroglancer *precomputed* segmentation (one precomputed:// source with region
+    names), the same format as the Allen atlas layer. This is what the catalog serves, because a
+    zarr segmentation + external segment_properties can blank the viewer. labels_zyx is uint32
+    (z, y, x); scale_um is the voxel size (z, y, x). out_dir must be a local path (CloudVolume
+    can't write to a UNC share; quantify_one already works in a local temp for network outputs).
+    """
+    _patch_intervaltree_monitor()
+    from aind_ccf_reg.utils import create_precomputed
+
+    out_dir = Path(out_dir)
+    present = sorted(int(i) for i in np.unique(labels_zyx) if i)
+    regions = {i: (names.get(str(i), (str(i), ""))[0] or str(i)) for i in present}
+    descs = {i: (names.get(str(i), ("", ""))[1] or "") for i in present}
+    # precomputed is x, y, z; resolution in nm, same axis order as the volume
+    img_xyz = np.ascontiguousarray(np.swapaxes(labels_zyx, 0, 2)).astype("uint32")
+    res_nm = [float(v) * 1000.0 for v in list(scale_um)[::-1]]
+    (out_dir / "segment_properties").mkdir(parents=True, exist_ok=True)
+    ng = {"regions": regions, "save_path": out_dir.as_posix(),
+          "scale_params": {"encoding": "compresso", "compressed_block": [16, 16, 16],
+                           "chunk_size": [32, 32, 32], "factors": [2, 2, 2], "num_scales": 3,
+                           "res": res_nm, "dims": list(img_xyz.shape)}}
+    seg = create_precomputed(ng)
+    seg.create_segmentation_info()
+    seg.build_precomputed_info()
+    seg.create_segment_precomputed(img_xyz)
+    info_p = out_dir / "segment_properties" / "info"
+    info = json.loads(info_p.read_text())
+    if any(descs.values()):
+        info["inline"]["properties"].append(
+            {"id": "description", "type": "description", "values": [descs[i] for i in present]})
+        info_p.write_text(json.dumps(info, indent=2))
+    return len(present)
+
+
 def write_csv(path, rows, lead):
     if not rows:
         return
@@ -459,6 +515,15 @@ def quantify_one(sample, args, label_sets, names):
                                     names.get(lname, {}), ids[np.unique(labels)])
             logger.info(f"{sample.name}: wrote {lname}_labels.ome.zarr ({n_lv} levels, on the raw grid: "
                         f"scale {sc} um, translation {tr} um)")
+            # the same labels as a Neuroglancer precomputed segmentation (what the catalog serves);
+            # best-effort so a CloudVolume hiccup never fails the quantification
+            try:
+                n_reg = write_label_precomputed(work / f"{lname}_annotation_precomputed", atlas_ids, sc,
+                                                names.get(lname, {}))
+                logger.info(f"{sample.name}: wrote {lname}_annotation_precomputed ({n_reg} regions)")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"{sample.name}: could not write {lname}_annotation_precomputed ({e}); "
+                               f"the label zarr is still available")
             summary = {"sample": str(sample), "labels": lname, "label_file": str(lpath),
                        "registration_grid": {"shape": list(grid_shape), "voxel_um": list(grid_um),
                                              "zarr_level": str(grid_path)},
